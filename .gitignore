@@ -1,0 +1,8 @@
+test.py
+inf_data.json
+__pycache__/
+logs/
+venv_linxy/
+instance/   
+.env
+model.pkl
