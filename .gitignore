@@ -5,5 +5,4 @@ logs/
 venv_linxy/
 instance/   
 .env
-model.pkl
 all_influencers.json
