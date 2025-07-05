@@ -7,4 +7,4 @@ colorlog
 flask_sqlalchemy
 xgboost
 pandas
-sklearn
+scikit-learn
