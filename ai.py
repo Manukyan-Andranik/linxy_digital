@@ -181,9 +181,9 @@ class AiModel:
         scores = self.model.predict(company_df)
         return scores
     
-    def get_best_10(self, company_data, influencers_data):
+    def get_best_5(self, company_data, influencers_data):
         """
-        Get the top 10 influencers based on company data
+        Get the top 5 influencers based on company data
         """
         if not self.is_trained:
             raise ValueError("Model has not been trained yet. Call train() first.")
@@ -217,12 +217,12 @@ class AiModel:
         # Predict scores for all influencers
         influencers_df['score'] = self.model.predict(company_df)
         
-        # Get top 10 influencers
-        top_10 = influencers_df.sort_values('score', ascending=False).head(10)
+        # Get top 5 influencers
+        top_5 = influencers_df.sort_values('score', ascending=False).head(5)
         
         # Format the result with relevant information
         result = []
-        for _, row in top_10.iterrows():
+        for _, row in top_5.iterrows():
             result.append({
                 'id': row['id'],
                 'full_name': row['full_name'],

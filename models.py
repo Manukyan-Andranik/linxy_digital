@@ -23,9 +23,6 @@ class BaseModel(db.Model):
         db.session.add(self)
         db.session.commit()
 
-
-
-
 class Users(BaseModel):
     __tablename__ = 'users'
 
@@ -113,7 +110,6 @@ class Influencers(BaseModel):
             "moscow": self.moscow,
         }   
 
-
 class Company(BaseModel):
     __tablename__ = 'company'
 
@@ -158,3 +154,17 @@ class Company(BaseModel):
                 "facebook": self.facebook,
                 "location": self.location,
             }
+
+
+class Orders(BaseModel):
+    __tablename__ = 'orders'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    company_id = db.Column(db.Integer, db.ForeignKey('company.id', ondelete='CASCADE'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    status = db.Column(db.String(50), nullable=False)
+    price = db.Column(db.Numeric(10, 2))
+    payment_method = db.Column(db.String(50))
+    payment_status = db.Column(db.String(50))
+    package = db.Column(db.String(50))

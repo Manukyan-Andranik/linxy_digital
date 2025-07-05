@@ -98,6 +98,37 @@ class DataManager:
                 "error_reason": str(e)
             }
 
+    def get_companyes_by_company_id(self, company_id, user_id):
+        try:
+            company = self.Company.query.filter_by(id=company_id).first()
+            if not company:
+                return {
+                    "status": "error",
+                    "error_reason": "Company not found"
+                }
+
+            if company.user_id != user_id:
+                return {
+                    "status": "error",
+                    "error_reason": "Unauthorized access. This company does not belong to the user."
+                }
+
+            return {
+                "status": "success",
+                "message": company.to_dict() if hasattr(company, 'to_dict') else {
+                    "id": company.id,
+                    "name": company.name if hasattr(company, "name") else "",
+                    "user_id": company.user_id
+                }
+            }
+
+        except SQLAlchemyError as e:
+            return {
+                "status": "error",
+                "error_reason": str(e)
+            }
+
+
     def get_influencer_by_id(self, influencer_id):
         try:
             influencer = self.Influencers.query.filter_by(id=influencer_id).first()
@@ -163,7 +194,7 @@ class DataManager:
             print(f"Cloudinary delete failed: {e}")
             return {'result': 'error', 'error': str(e)}
 
-    def __upload_influencers(self, json_path='all_influencers.json'):
+    def upload_influencers(self, json_path='all_influencers.json'):
         """
         Upload influencers and their associated user accounts using ORM.
         Email: inf1@gmail.com, inf2@gmail.com...
@@ -255,7 +286,8 @@ class DataManager:
                 "message": "Failed to process influencer data"
             }
 
-    def get_carts_data(self):
+    @staticmethod
+    def get_charts_data():
         with open('chart_data/charts.json', 'r') as f:
             carts = json.load(f)
         return carts
