@@ -2,7 +2,7 @@ test.py
 inf_data.json
 __pycache__/
 logs/
-venv_linxy/
+linxy/
 instance/   
 .env
 all_influencers.json

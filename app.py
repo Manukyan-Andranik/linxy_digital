@@ -1,292 +1,334 @@
 import os
-from datetime import timedelta
+import stripe
+from flask import Flask, render_template, request, redirect, url_for, flash
+from flask_login import current_user, login_user, logout_user, login_required
 
-from flask_cors import CORS, cross_origin
-from flask import Flask, render_template, request, jsonify
-from flask_jwt_extended import (
-    JWTManager, get_jwt, create_access_token, create_refresh_token,
-    jwt_required, get_jwt_identity
+from config import Config
+from extensions import db, login_manager, migrate, mail
+from forms import (
+    LoginForm, RegistrationForm, CampaignForm,
+    MessageForm
 )
-from werkzeug.security import generate_password_hash, check_password_hash
-from dotenv import load_dotenv
+from models import (
+    User, Profile, Subscription, Campaign, Collaboration,
+    Deliverable, Payment, Message, Influencer
+)
 
-from log import Logger
-from datamanager import DataManager
-from models import Users, Influencers, Company, db, TokenBlacklist
-from utils import ResponseHandler, DEFAULT_COMPANY_URL
+from data_manager import DataManager, recommend_influencers
 
-load_dotenv()
-
-# Logger setup
-logger = Logger.load_logger(__name__)
-
-# Initialize Flask app
 app = Flask(__name__)
+app.config.from_object(Config)
 
-# DB & JWT Configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///linxy_app_last.db')
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'dev-secret-key')
-app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(minutes=15)
-app.config['JWT_REFRESH_TOKEN_EXPIRES'] = timedelta(days=30)
-
-# Init Extensions
+# Initialize extensions properly
 db.init_app(app)
-jwt = JWTManager(app)
-CORS(app)
-DATA_MANAGER = DataManager(db, Users, Influencers, Company)
+migrate.init_app(app, db)
+mail.init_app(app)
 
-# Create tables
-with app.app_context():
-    db.create_all()
+# Initialize LoginManager and set login view
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+login_manager.login_message_category = 'info'
 
-# JWT Blocklist
-@jwt.token_in_blocklist_loader
-def is_token_revoked(jwt_header, jwt_payload):
-    jti = jwt_payload["jti"]
-    return db.session.query(TokenBlacklist.id).filter_by(jti=jti).first() is not None
+data_manager = DataManager(
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        host=os.getenv("DB_HOST"),
+        port= os.getenv("DB_PORT")
+    )
+
+# Initialize Stripe with secret key
+stripe.api_key = app.config.get('STRIPE_SECRET_KEY')
+
+@app.template_filter('float_format')
+def float_format_filter(value, format_str='%.2f', skip_none=False):
+    if skip_none and (value is None or value == ''):
+        return ''
+    try:
+        return format_str % float(value)
+    except (ValueError, TypeError):
+        return value
 
 @app.route('/')
 def home():
-    chart_data = DATA_MANAGER.get_charts_data()
-    
-    return jsonify(ResponseHandler.success("Welcome to DevHacks", {
-        "data": chart_data
-    }))
+    return render_template('index.html')
 
-# --------- Auth Routes ---------
-@app.route('/signup', methods=['POST', 'GET'])
-def signup():
-    try:
-        email = request.form['email']
-        password = request.form['password']
-        full_name = request.form['full_name']
-        role = request.form['role']
-        phone = request.form['phone']
-        photo = request.files.get('photo')
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for('home'))
+    form = LoginForm()
+    if form.validate_on_submit():
+        user = User.query.filter_by(email=form.email.data).first()
+        if user and user.check_password(form.password.data):
+            login_user(user, remember=form.remember.data)
+            next_page = request.args.get('next')
+            return redirect(next_page) if next_page else redirect(url_for('home'))
+        else:
+            flash('Login unsuccessful. Please check email and password', 'danger')
+    return render_template('auth/login.html', title='Login', form=form)
 
-        photo_url = DataManager.upload_image_to_cloudinary(photo) if photo else None
-        hashed_password = generate_password_hash(password)
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    form = RegistrationForm()
+    if form.validate_on_submit():
+        user = User(
+            username=form.username.data,
+            email=form.email.data,
+            role='influencer' if form.account_type.data == 'influencer' else 'user'
+        )
+        user.set_password(form.password.data)
+        db.session.add(user)
+        db.session.commit()
 
-        user = Users(email=email, password=hashed_password, full_name=full_name,
-                     photo_url=photo_url, role=role, phone=phone)
-        user.save()
+        # Create profile if influencer
+        if form.account_type.data == 'influencer':
+            profile = Profile(user_id=user.id)
+            db.session.add(profile)
+            db.session.commit()
 
-        return jsonify(ResponseHandler.success("User created successfully")), 200
-    except Exception as e:
-        logger.error(f"Signup failed: {e}")
-        return jsonify(ResponseHandler.error("Signup failed")), 500
+        flash('Your account has been created! You can now log in', 'success')
+        return redirect(url_for('login'))
+    return render_template('auth/register.html', title='Register', form=form)
 
-@app.route('/signin', methods=['POST', 'GET'])
-@cross_origin(supports_credentials=True)
-def signin():
-    try:
-        data = request.get_json()
-        email = data.get('email')
-        password = data.get('password')
-
-        if not email or not password:
-            return jsonify(ResponseHandler.error("Email and password are required")), 400
-
-        user_response = DATA_MANAGER.get_user_by_email(email)
-        if not user_response or not user_response.get("message"):
-            return jsonify(ResponseHandler.unauthorized("Invalid credentials")), 401
-
-        user = user_response["message"]
-
-        if not check_password_hash(user.password, password):
-            return jsonify(ResponseHandler.unauthorized("Invalid credentials")), 401
-
-        user_id = str(user.id)
-        access_token = create_access_token(identity=user_id)
-        refresh_token = create_refresh_token(identity=user_id)
-
-        return jsonify(ResponseHandler.success("Signed in successfully", {
-            'access_token': access_token,
-            'refresh_token': refresh_token
-        })), 200
-    except Exception as e:
-        logger.error(f"Signin failed: {e}")
-        return jsonify(ResponseHandler.error("Signin failed")), 500
-
-@app.route('/refresh', methods=['POST', 'GET'])
-@jwt_required(refresh=True)
-def refresh_token():
-    user_id = get_jwt_identity()
-    access_token = create_access_token(identity=user_id)
-    return jsonify(ResponseHandler.success("Token refreshed", {'access_token': access_token})), 200
-
-@app.route('/logout', methods=['POST', 'GET'])
-@jwt_required()
+@app.route('/logout')
 def logout():
-    jti = get_jwt()["jti"]
-    user_id = get_jwt_identity()
-    blacklisted_token = TokenBlacklist(jti=jti, user_id=user_id, reason="logout")
-    db.session.add(blacklisted_token)
-    db.session.commit()
-    return jsonify(ResponseHandler.success("Successfully logged out")), 200
+    logout_user()
+    return redirect(url_for('home'))
 
-# --------- Protected Route Example ---------
-@app.route('/profile', methods=['POST', 'GET'])
-@jwt_required()
-def profile():
-    user_id = get_jwt_identity()
-    user = Users.query.get(user_id)
-
-    if not user:
-        return jsonify(ResponseHandler.error("User not found")), 404
-
-    profile_data = {
-        "id": user.id,
-        "full_name": user.full_name,
-        "phone": user.phone,
-        "photo_url": user.photo_url,
-        "email": user.email,
-        "role": user.role,
-    }
-
-    if user.role == 'company_admin':
-        companies = Company.query.filter_by(user_id=user.id).all()
-        profile_data['companies'] = [
-            {
-                "id": c.id,
-                "sphere": c.sphere,
-                "description": c.description,
-                "linkdin": c.linkdin,
-                "instagram": c.instagram,
-                "facebook": c.facebook,
-                "location": c.location,
-            } for c in companies
-        ]
-    elif user.role == 'influencer':
-        price_list = Influencers.query.filter_by(user_id=user.id).all()
-        profile_data['price_list'] = [
-            {
-                "id": p.id,
-                "social_net": p.social_net,
-                "link": p.link,
-                "price_stories": str(p.price_stories),
-                "story_with_travel_to_location": str(p.story_with_travel_to_location),
-                "subs": p.subs,
-                "engagement_rate": str(p.engagement_rate),
-            } for p in price_list
-        ]
-
-    return jsonify(ResponseHandler.success("Profile fetched", profile_data)), 200
-
-@app.route('/create_company', methods=['POST', 'GET'])
-@cross_origin(supports_credentials=True)
-@jwt_required()
-def create_company():
-    user_id = get_jwt_identity()
-    user = DATA_MANAGER.get_user_by_id(user_id)
-    if not user or user["message"].role != 'company_admin':
-        return jsonify(ResponseHandler.error("Unauthorized or invalid role")), 403
-
-    logo = request.files.get('logo')
-    print(logo)
+@app.route('/profile/<username>')
+@login_required
+def profile(username):
+    # Get the user profile data
+    user = User.query.filter_by(username=username).first_or_404()
+    profile = Profile.query.filter_by(user_id=user.id).first()
+    subscription = Subscription.query.filter_by(user_id=user.id).first()
     
-    if not logo:
-        return jsonify(ResponseHandler.error("Logo is required")), 400
-
-    # try:
-    logo_img = request.files.get('logo')
-            # Optional: Cloudinary setup (replace with actual)
-    if logo_img:
-        # Replace this with your actual Cloudinary call
-        logo_url = DataManager.upload_image_to_cloudinary(logo_img, folder='company_logos')
+    # Get campaigns created by this user (if they're a brand)
+    campaigns = Campaign.query.filter_by(creator_id=user.id).order_by(Campaign.created_at.desc()).limit(5).all()
+    
+    # Get collaborations (if they're an influencer)
+    collaborations = Collaboration.query.filter_by(influencer_id=user.id).order_by(Collaboration.created_at.desc()).limit(5).all()
+    
+    # Get stats for influencers
+    if user.is_influencer():
+        completed_collabs = Collaboration.query.filter_by(
+            influencer_id=user.id, 
+            status='completed'
+        ).count()
+        
+        total_earnings = db.session.query(
+            db.func.sum(Payment.amount)
+            .filter(
+                Payment.collaboration_id == Collaboration.id,
+                Collaboration.influencer_id == user.id,
+                Payment.status == 'paid'
+            ).scalar() or 0)
     else:
-        logo_url = DEFAULT_COMPANY_URL
-    print(request.form)
-    company = Company(
-        logo_url=logo_url,
-        user_id=user_id,
-        sphere=request.form['sphere'],
-        description=request.form['description'],
-        linkdin=request.form['linkdin'],
-        instagram=request.form['instagram'],
-        facebook=request.form['facebook'],
-        location=request.form['location'],
-        title=request.form['title']
+        completed_collabs = None
+        total_earnings = None
+    
+    return render_template(
+        'profile.html',
+        user=user,
+        profile=profile,
+        subscription=subscription,
+        campaigns=campaigns,
+        collaborations=collaborations,
+        completed_collabs=completed_collabs,
+        total_earnings=total_earnings
     )
-    company.save()
-    return jsonify(ResponseHandler.success("Company created", {"company_id": company.id})), 201
 
-    # except Exception as e:
-    #     logger.error(f"Company creation failed: {e}")
-    #     return jsonify(ResponseHandler.error("Company creation failed")), 500
+@app.route('/profile/edit', methods=['GET', 'POST'])
+@login_required
+def edit_profile():
+    pass
 
-@app.route('/companyes', methods=['GET'])
-@cross_origin(supports_credentials=True)
-@jwt_required()
-def get_company():
-    user_id = get_jwt_identity()
-    user = DATA_MANAGER.get_user_by_id(user_id)
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    with DataManager(
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        host=os.getenv("DB_HOST"),
+        port= os.getenv("DB_PORT")
+    ) as dm:
+        all_influencers = dm.get_all_influencers(limit=100)
+        for influencer in all_influencers:
+            influencer_data = dm.get_influencer_data_points(influencer['id'])
+            influencer['data_points'] = influencer_data
+        return render_template('influencers.html', influencers=all_influencers)
 
-    if not user:
-        return jsonify(ResponseHandler.error("User not found")), 404
+@app.route("/influencers")   # LIST Influencers
+@login_required
+def browse_influencers():
+    with DataManager(
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        host=os.getenv("DB_HOST"),
+        port= os.getenv("DB_PORT")
+    ) as dm:
+        all_influencers = dm.get_all_influencers(limit=100)
+        for influencer in all_influencers:
+            influencer_data = dm.get_influencer_data_points(influencer['id'])
+            influencer['data_points'] = influencer_data
+        return render_template('influencers.html', influencers=all_influencers)
 
-    companyes = DATA_MANAGER.get_companyes_by_user_id(user_id)["message"]
-    print(companyes)
-    if not companyes:
-        return jsonify(ResponseHandler.error("Company not found")), 404
+@app.route('/influencer/<int:influencer_id>')    # VIEW Influencer Profile TODO
+@login_required
+def influencer_profile(influencer_id):
+    influencer = Influencer.query.get_or_404(influencer_id)
 
-    # Convert each company to dictionary
-    companyes_data = [company.to_dict() for company in companyes]
+    profile = Profile.query.filter_by(user_id=influencer_id).first()
+    return render_template('influencers/profile.html', influencer=influencer, profile=profile)
 
-    return jsonify(ResponseHandler.success("Company fetched", data=companyes_data)), 200
+@app.route('/campaigns')    # LIST Campaigns
+@login_required
+def list_campaigns():
+    page = request.args.get('page', 1, type=int)
+    per_page = 10
 
-# _____________ INFLUENCER ROUTES ____________
-@app.route('/influencers', methods=['GET'])
-@cross_origin(supports_credentials=True)
-@jwt_required()
-def get_influencers():
-    # res = DATA_MANAGER.upload_influencers()
-    # print(res)
-    user_id = get_jwt_identity()
-    user = DATA_MANAGER.get_user_by_id(user_id)
+    if current_user.role == 'influencer':
+        collaborations = Collaboration.query.filter_by(influencer_id=current_user.id).all()
+        campaign_ids = [c.campaign_id for c in collaborations]
+        campaigns_pagination = Campaign.query.filter(Campaign.id.in_(campaign_ids)).order_by(Campaign.created_at.desc()).paginate(page=page, per_page=per_page)
+    else:
+        campaigns_pagination = Campaign.query.filter_by(creator_id=current_user.id).order_by(Campaign.created_at.desc()).paginate(page=page, per_page=per_page)
 
-    if not user:
-        return jsonify(ResponseHandler.error("User not found")), 404
+    # Manually add computed fields if necessary
+    for campaign in campaigns_pagination.items:
+        campaign.influencer_count = len(campaign.collaborations)
+        campaign.brand = current_user.company_name if hasattr(current_user, 'company_name') else "N/A"
 
-    influencers = DATA_MANAGER.get_influencers()["message"]
-    if not influencers:
-        return jsonify(ResponseHandler.error("Influencer not found")), 404
+    return render_template('campaigns/list.html', campaigns=campaigns_pagination)
 
-    influencers_data = [influencers for influencers in influencers] 
+@app.route('/campaigns/<int:campaign_id>/view')    # VIEW Campaign
+@login_required
+def view_campaign(campaign_id):
+    campaigns = Campaign.query.filter_by(creator_id=current_user.id).order_by(Campaign.created_at.desc()).limit(5).all()
+    collaborations = Collaboration.query.filter_by(influencer_id=current_user.id).order_by(Collaboration.created_at.desc()).limit(5).all()
+    # Get AI recommendations
+    recommended_influencers = recommend_influencers()
+    # Calculate stats
+    active_campaigns = Campaign.query.filter_by(creator_id=current_user.id, status='active').count()
+    total_influencers = Collaboration.query.filter(Collaboration.campaign_id.in_(
+        [c.id for c in Campaign.query.filter_by(creator_id=current_user.id).all()]
+    )).count()
+    campaign = Campaign.query.get_or_404(campaign_id)
 
+    return render_template('campaigns/view.html',
+                            campaign=campaign,
+                           
+                           recommended_influencers=recommended_influencers,
+                           campaigns=campaigns,
+                           collaborations=collaborations,
+                           active_campaigns=active_campaigns,
+                           total_influencers=total_influencers)
 
-    return jsonify(ResponseHandler.success("Influencers fetched", data=influencers_data)), 200
-    # Convert each influencer to dictionary
+@app.route('/campaign/create', methods=['GET', 'POST'])
+@login_required
+def create_campaign():
+    if current_user.role == 'influencer':
+        flash('Influencers cannot create campaigns', 'warning')
+        return redirect(url_for('dashboard'))
 
-@app.route('/company/<int:company_id>/influencers', methods=['GET'])
-@cross_origin(supports_credentials=True)
-@jwt_required()
-def get_influencers_by_company(company_id):
-    user_id = get_jwt_identity()
-    user = DATA_MANAGER.get_user_by_id(user_id)
+    form = CampaignForm()
+    if form.validate_on_submit():
+        campaign = Campaign(
+            title=form.title.data,
+            description=form.description.data,
+            creator_id=current_user.id,
+            budget=form.budget.data,
+            start_date=form.start_date.data,
+            end_date=form.end_date.data,
+            requirements=form.requirements.data,
+            target_audience={
+                'gender': form.target_gender.data,
+                'age_min': form.target_age_min.data,
+                'age_max': form.target_age_max.data,
+                'location': form.target_location.data
+            }
+        )
+        db.session.add(campaign)
+        db.session.commit()
+        flash('Your campaign has been created!', 'success')
+        return redirect(url_for('view_campaign', campaign_id=campaign.id))
+    return render_template('campaigns/create.html', form=form)
 
-    if not user:
-        return jsonify(ResponseHandler.error("User not found")), 404
+@app.route('/collaboration/<int:collaboration_id>')
+@login_required
+def view_collaboration(collaboration_id):
+    collaboration = Collaboration.query.get_or_404(collaboration_id)
 
-    company = DATA_MANAGER.get_companyes_by_company_id(company_id, user_id)
+    if current_user.id not in [collaboration.campaign.creator_id, collaboration.influencer_id]:
+        flash('You do not have access to this collaboration', 'danger')
+        return redirect(url_for('dashboard'))
 
-    if not company:
-        return jsonify(ResponseHandler.error("Company not found")), 404
+    deliverables = Deliverable.query.filter_by(collaboration_id=collaboration_id).all()
+    messages = Message.query.filter(
+        ((Message.sender_id == current_user.id) & (Message.recipient_id == collaboration.influencer_id)) |
+        ((Message.sender_id == collaboration.influencer_id) & (Message.recipient_id == current_user.id))
+    ).order_by(Message.timestamp.asc()).all()
 
-    influencers_data = DATA_MANAGER.get_influencers()["message"]
+    form = MessageForm()
+    return render_template('collaboration/view.html',
+                           collaboration=collaboration,
+                           deliverables=deliverables,
+                           messages=messages,
+                           form=form)
 
-    recomendations = DATA_MANAGER.AI_MODEL.get_best_5(company, influencers_data)
+@app.route('/send_message/<int:recipient_id>', methods=['POST'])
+@login_required
+def send_message(recipient_id):
+    recipient = User.query.get_or_404(recipient_id)
+    form = MessageForm()
+    if form.validate_on_submit():
+        msg = Message(
+            sender_id=current_user.id,
+            recipient_id=recipient.id,
+            body=form.message.data
+        )
+        db.session.add(msg)
+        db.session.commit()
+        flash('Your message has been sent.', 'success')
+    return redirect(request.referrer or url_for('dashboard'))
 
-    print(recomendations)
-    return jsonify(ResponseHandler.success("Influencers fetched", data=recomendations)), 200
+@app.route('/pricing')
+def pricing():
+    return render_template('payments/plans.html', plans=app.config.get('PRICING_PLANS', {}))
 
-# --------- Example Refresh Protected Route ---------
-@app.route('/protected', methods=['POST', 'GET'])
-@jwt_required()
-def protected():
-    return jsonify(ResponseHandler.success("Access granted", {'user_id': get_jwt_identity()})), 200
+@app.route('/checkout/<plan>/<period>', methods=['GET', 'POST'])
+@login_required
+def checkout(plan, period):
+    pass
 
-# Run App
+@app.route('/payment/<plan_id>')
+def payment(plan_id):
+   pass
+
+@app.route('/create-subscription', methods=['POST'])
+def create_subscription():
+    pass
+
+@app.route('/payment/success')
+def payment_success():
+    pass
+
+def get_stripe_price_id(plan_id):
+    pass
+
+@app.route('/webhook', methods=['POST'])
+def stripe_webhook():
+    pass
+
+# User loader for Flask-Login
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    app.run(host="0.0.0.0", port=5001, debug=True) 
